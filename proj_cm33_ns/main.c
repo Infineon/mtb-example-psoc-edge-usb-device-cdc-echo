@@ -8,33 +8,33 @@
 *
 *
 ********************************************************************************
- * (c) 2023-2026, Infineon Technologies AG, or an affiliate of Infineon
- * Technologies AG. All rights reserved.
- * This software, associated documentation and materials ("Software") is
- * owned by Infineon Technologies AG or one of its affiliates ("Infineon")
- * and is protected by and subject to worldwide patent protection, worldwide
- * copyright laws, and international treaty provisions. Therefore, you may use
- * this Software only as provided in the license agreement accompanying the
- * software package from which you obtained this Software. If no license
- * agreement applies, then any use, reproduction, modification, translation, or
- * compilation of this Software is prohibited without the express written
- * permission of Infineon.
- *
- * Disclaimer: UNLESS OTHERWISE EXPRESSLY AGREED WITH INFINEON, THIS SOFTWARE
- * IS PROVIDED AS-IS, WITH NO WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
- * INCLUDING, BUT NOT LIMITED TO, ALL WARRANTIES OF NON-INFRINGEMENT OF
- * THIRD-PARTY RIGHTS AND IMPLIED WARRANTIES SUCH AS WARRANTIES OF FITNESS FOR A
- * SPECIFIC USE/PURPOSE OR MERCHANTABILITY.
- * Infineon reserves the right to make changes to the Software without notice.
- * You are responsible for properly designing, programming, and testing the
- * functionality and safety of your intended application of the Software, as
- * well as complying with any legal requirements related to its use. Infineon
- * does not guarantee that the Software will be free from intrusion, data theft
- * or loss, or other breaches ("Security Breaches"), and Infineon shall have
- * no liability arising out of any Security Breaches. Unless otherwise
- * explicitly approved by Infineon, the Software may not be used in any
- * application where a failure of the Product or any consequences of the use
- * thereof can reasonably be expected to result in personal injury.
+* (c) 2023-2026, Infineon Technologies AG, or an affiliate of Infineon
+* Technologies AG. All rights reserved.
+* This software, associated documentation and materials ("Software") is
+* owned by Infineon Technologies AG or one of its affiliates ("Infineon")
+* and is protected by and subject to worldwide patent protection, worldwide
+* copyright laws, and international treaty provisions. Therefore, you may use
+* this Software only as provided in the license agreement accompanying the
+* software package from which you obtained this Software. If no license
+* agreement applies, then any use, reproduction, modification, translation, or
+* compilation of this Software is prohibited without the express written
+* permission of Infineon.
+*
+* Disclaimer: UNLESS OTHERWISE EXPRESSLY AGREED WITH INFINEON, THIS SOFTWARE
+* IS PROVIDED AS-IS, WITH NO WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+* INCLUDING, BUT NOT LIMITED TO, ALL WARRANTIES OF NON-INFRINGEMENT OF
+* THIRD-PARTY RIGHTS AND IMPLIED WARRANTIES SUCH AS WARRANTIES OF FITNESS FOR A
+* SPECIFIC USE/PURPOSE OR MERCHANTABILITY.
+* Infineon reserves the right to make changes to the Software without notice.
+* You are responsible for properly designing, programming, and testing the
+* functionality and safety of your intended application of the Software, as
+* well as complying with any legal requirements related to its use. Infineon
+* does not guarantee that the Software will be free from intrusion, data theft
+* or loss, or other breaches ("Security Breaches"), and Infineon shall have
+* no liability arising out of any Security Breaches. Unless otherwise
+* explicitly approved by Infineon, the Software may not be used in any
+* application where a failure of the Product or any consequences of the use
+* thereof can reasonably be expected to result in personal injury.
 *******************************************************************************/
 #include "USB.h"
 #include "USB_CDC.h"
@@ -105,6 +105,10 @@ static void usb_add_cdc(void)
     USB_ADD_EP_INFO       ep_int_in;
 
     memset(&init_data, 0, sizeof(init_data));
+    /* Zero-init the EP info structs so unused fields (e.g. ISO_Type) are defined */
+    memset(&ep_bulk_in, 0, sizeof(ep_bulk_in));
+    memset(&ep_bulk_out, 0, sizeof(ep_bulk_out));
+    memset(&ep_int_in, 0, sizeof(ep_int_in));
     ep_bulk_in.Flags          = USB_ENABLE_FLAG;               /* Flags not used */
     ep_bulk_in.InDir          = USB_DIR_IN;                    /* IN direction (Device to Host) */
     ep_bulk_in.Interval       = USB_BULK_IN_INTERVAL;          /* Interval not used for Bulk endpoints */
@@ -189,8 +193,9 @@ int main(void)
     /* Start the USB stack */
     USBD_Start();
 
-    /* Turning the LED on to indicate device is active */
-    Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN, GPIO_HIGH);
+    /* Keep the LED off until the device is enumerated and configured. It will
+     * blink while enumeration is in progress and turn solid on once configured. */
+    Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN, GPIO_LOW);
 
     /* Enable CM55. */
     /* CY_CM55_APP_BOOT_ADDR must be updated if CM55 memory layout is changed.*/
@@ -198,20 +203,45 @@ int main(void)
 
     for (;;)
     {
-        /* Wait for configuration */
+        /* Wait for configuration. Blink the LED while the device is not yet
+         * enumerated/configured or while it is suspended. */
         while (USB_STAT_CONFIGURED != (USBD_GetState() & (USB_STAT_CONFIGURED | USB_STAT_SUSPENDED)))
         {
             Cy_GPIO_Inv(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN);
             Cy_SysLib_Delay(USB_CONFIG_DELAY_MS);
+            /* Reset any partially accumulated data while disconnected */
+            num_bytes_to_write = RESET_VAL;
         }
 
+        /* Device is enumerated and configured: drive the LED solid on */
+        Cy_GPIO_Write(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN, GPIO_HIGH);
+
         num_bytes_received = USBD_CDC_Receive(usb_cdc_handle, read_buffer, sizeof(read_buffer), 0);
+
+        /* USBD_CDC_Receive returns <= 0 on timeout, reset or disconnect. Skip
+         * processing to avoid an out-of-bounds read and an oversized memcpy. */
+        if (num_bytes_received <= 0)
+        {
+            Cy_SysPm_CpuEnterSleep(CY_SYSPM_WAIT_FOR_INTERRUPT);
+            continue;
+        }
+
+        /* Clamp so the accumulated data never overflows write_buffer */
+        if (num_bytes_received > (int)(sizeof(write_buffer) - num_bytes_to_write))
+        {
+            num_bytes_received = (int)(sizeof(write_buffer) - num_bytes_to_write);
+        }
 
         memcpy(write_buffer + num_bytes_to_write, read_buffer, num_bytes_received);
 
         num_bytes_to_write +=  num_bytes_received;
 
-        if ( ( num_bytes_to_write > RESET_VAL ) && ( read_buffer[num_bytes_received - 1] == '\n' ) )
+        /* Flush the accumulated data when a newline is received or when
+         * write_buffer is full. The last received byte is only inspected when
+         * num_bytes_received > 0 to avoid an out-of-bounds read. */
+        if ( ( num_bytes_to_write > RESET_VAL ) &&
+             ( ( num_bytes_to_write == (int)sizeof(write_buffer) ) ||
+               ( ( num_bytes_received > RESET_VAL ) && ( read_buffer[num_bytes_received - 1] == '\n' ) ) ) )
         {
 
             /* Sending one packet to host */
